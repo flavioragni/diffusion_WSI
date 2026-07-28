@@ -1,0 +1,600 @@
+from __future__ import annotations
+
+import os
+import csv
+import math
+import numpy as np
+from PIL import Image
+
+from skimage.color import rgb2gray
+from skimage.filters import threshold_otsu
+from scipy.ndimage import (
+    binary_fill_holes,
+    binary_dilation as ndi_binary_dilation,
+    binary_closing as ndi_binary_closing,
+)
+from skimage.morphology import disk
+from skimage.measure import label, regionprops
+
+from tiatoolbox.wsicore.wsireader import WSIReader
+
+
+# -------------------------
+# Thumbnail utilities
+# -------------------------
+
+def _thumb_to_rgb_uint8_np(x) -> np.ndarray:
+    """
+    Accepts PIL.Image or np.ndarray from tiatoolbox slide_thumbnail().
+    Returns RGB uint8 ndarray (H, W, 3).
+    """
+    if isinstance(x, Image.Image):
+        if x.mode != "RGB":
+            x = x.convert("RGB")
+        return np.asarray(x, dtype=np.uint8)
+
+    if isinstance(x, np.ndarray):
+        arr = x
+        if np.issubdtype(arr.dtype, np.floating):
+            arr = np.clip(arr, 0.0, 1.0)
+            arr = (arr * 255.0).round().astype(np.uint8)
+        else:
+            arr = arr.astype(np.uint8, copy=False)
+
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        elif arr.ndim == 3 and arr.shape[2] == 3:
+            pass
+        else:
+            raise ValueError(f"Unexpected thumbnail shape: {arr.shape}")
+
+        return arr
+
+    raise TypeError(f"Unsupported thumbnail type: {type(x)}")
+
+
+def get_thumbnail(reader: WSIReader, thumbnail_mpp: float) -> np.ndarray:
+    """Thumbnail at chosen MPP."""
+    thumb_obj = reader.slide_thumbnail(resolution=float(thumbnail_mpp), units="mpp")
+    return _thumb_to_rgb_uint8_np(thumb_obj)
+
+
+# -------------------------
+# Tissue detection utilities
+# -------------------------
+
+def make_masks_for_components_and_final(
+    rgb_img_np: np.ndarray,
+    merge_radius_px: int = 12,
+):
+    """
+    - component_mask: Otsu + fill holes + optional closing to bridge thin gaps
+    - final_mask    : Otsu + dilation + fill holes for nicer borders
+    """
+    gray = rgb2gray(rgb_img_np).astype(np.float32)
+    T = threshold_otsu(gray)
+    base = gray < T  # True = tissue
+
+    component_mask = binary_fill_holes(base)
+    if merge_radius_px and merge_radius_px > 0:
+        se_merge = disk(merge_radius_px).astype(bool)
+        component_mask = ndi_binary_closing(component_mask, structure=se_merge, iterations=1)
+
+    se_final = disk(5).astype(bool)
+    dil = ndi_binary_dilation(base, structure=se_final, iterations=1)
+    final_mask = binary_fill_holes(dil)
+
+    return component_mask, final_mask
+
+
+# -------------------------
+# CSV helpers
+# -------------------------
+
+def read_paths_from_csv(csv_path: str, col: str = "path"):
+    paths = []
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if col not in (reader.fieldnames or []):
+            raise ValueError(f"CSV must contain column '{col}'. Found: {reader.fieldnames}")
+        for row in reader:
+            p = (row[col] or "").strip()
+            if p:
+                paths.append(p)
+    return paths
+
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+
+# -------------------------
+# Component selection logic
+# -------------------------
+
+def _selected_component_bboxes_from_thumb(
+    thumb_rgb: np.ndarray,
+    pad: int = 20,
+    min_area_ratio: float = 0.01,
+    merge_radius_px: int = 20,
+    use_8_connectivity: bool = True,
+    split_area_frac: float = 0.25,
+    density_single_thresh: float = 0.5,
+    small_component_policy: str = "union",
+):
+    """
+    Returns:
+      selected_bboxes: list of (rmin, rmax, cmin, cmax, area_px)
+      final_mask: full final mask at thumbnail resolution
+      comp_mask: component mask
+    """
+    if small_component_policy not in ("union", "largest"):
+        raise ValueError("small_component_policy must be 'union' or 'largest'")
+
+    H, W = thumb_rgb.shape[:2]
+
+    comp_mask, final_mask = make_masks_for_components_and_final(
+        thumb_rgb,
+        merge_radius_px=merge_radius_px,
+    )
+
+    connectivity = 2 if use_8_connectivity else 1
+    labeled = label(comp_mask, connectivity=connectivity)
+    props = regionprops(labeled)
+
+    if not props:
+        return [(0, H, 0, W, 0)], final_mask, comp_mask
+
+    total_area = int(comp_mask.sum())
+    min_area = max(1, int(total_area * min_area_ratio))
+    kept = [p for p in props if p.area >= min_area]
+    if not kept:
+        kept = [max(props, key=lambda p: p.area)]
+    kept.sort(key=lambda p: p.area, reverse=True)
+
+    sum_area = float(sum(p.area for p in kept))
+
+    rmin_all = min(p.bbox[0] for p in kept)
+    cmin_all = min(p.bbox[1] for p in kept)
+    rmax_all = max(p.bbox[2] for p in kept)
+    cmax_all = max(p.bbox[3] for p in kept)
+
+    union_h = rmax_all - rmin_all
+    union_w = cmax_all - cmin_all
+    union_area = max(1, union_h * union_w)
+    density = sum_area / union_area
+
+    area_fracs = [p.area / sum_area for p in kept]
+    big_idxs = [i for i, f in enumerate(area_fracs) if f >= split_area_frac]
+
+    selected = []
+
+    # Split into big components if >= 2 big ones
+    if len(big_idxs) >= 2:
+        for i in big_idxs:
+            p = kept[i]
+            r0, c0, r1, c1 = p.bbox
+            rmin = max(0, r0 - pad)
+            rmax = min(H, r1 + pad)
+            cmin = max(0, c0 - pad)
+            cmax = min(W, c1 + pad)
+            selected.append((rmin, rmax, cmin, cmax, int(p.area)))
+        return selected, final_mask, comp_mask
+
+    # Otherwise single selection
+    if small_component_policy == "largest" and density < density_single_thresh:
+        p = kept[0]
+        r0, c0, r1, c1 = p.bbox
+        rmin = max(0, r0 - pad)
+        rmax = min(H, r1 + pad)
+        cmin = max(0, c0 - pad)
+        cmax = min(W, c1 + pad)
+        selected.append((rmin, rmax, cmin, cmax, int(p.area)))
+        return selected, final_mask, comp_mask
+
+    # Default: union crop
+    rmin = max(0, rmin_all - pad)
+    rmax = min(H, rmax_all + pad)
+    cmin = max(0, cmin_all - pad)
+    cmax = min(W, cmax_all + pad)
+    selected.append((rmin, rmax, cmin, cmax, int(sum_area)))
+    return selected, final_mask, comp_mask
+
+
+# -------------------------
+# Canvas helpers
+# -------------------------
+
+def embed_on_canvas_then_resize(
+    rgb_np: np.ndarray,
+    mask_np: np.ndarray,
+    canvas_size_px: int,
+    target_size: int,
+    crop_if_needed: bool = False,
+):
+    """
+    Put crop on a square canvas without rescaling first, then resize full canvas
+    to target_size x target_size.
+
+    If crop_if_needed=False:
+        raise ValueError when crop does not fit canvas.
+
+    If crop_if_needed=True:
+        center-crop oversized crop to fit canvas.
+    """
+    canvas_size_px = int(canvas_size_px)
+    target_size = int(target_size)
+
+    h, w = rgb_np.shape[:2]
+
+    if h > canvas_size_px or w > canvas_size_px:
+        if not crop_if_needed:
+            raise ValueError(
+                f"Crop size {h}x{w} exceeds canvas_size_px={canvas_size_px}."
+            )
+
+        # center-crop to fit the canvas
+        y0 = max(0, (h - canvas_size_px) // 2)
+        x0 = max(0, (w - canvas_size_px) // 2)
+        y1 = y0 + min(h, canvas_size_px)
+        x1 = x0 + min(w, canvas_size_px)
+
+        rgb_np = rgb_np[y0:y1, x0:x1, :]
+        mask_np = mask_np[y0:y1, x0:x1]
+        h, w = rgb_np.shape[:2]
+
+    canvas_rgb = np.ones((canvas_size_px, canvas_size_px, 3), dtype=np.uint8) * 255
+    canvas_mask = np.zeros((canvas_size_px, canvas_size_px), dtype=np.uint8)
+
+    yy = (canvas_size_px - h) // 2
+    xx = (canvas_size_px - w) // 2
+
+    canvas_rgb[yy:yy + h, xx:xx + w, :] = rgb_np
+    canvas_mask[yy:yy + h, xx:xx + w] = (mask_np.astype(np.uint8) * 255)
+
+    rgb_out = Image.fromarray(canvas_rgb).resize(
+        (target_size, target_size),
+        resample=Image.BILINEAR,
+    )
+    mask_out = Image.fromarray(canvas_mask).resize(
+        (target_size, target_size),
+        resample=Image.NEAREST,
+    )
+
+    return rgb_out, mask_out
+
+
+# -------------------------
+# Canvas size estimation
+# -------------------------
+
+def estimate_canvas_size_from_csv(
+    csv_path: str,
+    col: str = "path",
+    thumbnail_mpp: float = 8.0,
+    pad: int = 20,
+    min_area_ratio: float = 0.01,
+    merge_radius_px: int = 20,
+    use_8_connectivity: bool = True,
+    split_area_frac: float = 0.25,
+    density_single_thresh: float = 0.5,
+    small_component_policy: str = "union",
+    percentile: float = 100.0,
+    round_up_to: int = 32,
+):
+    """
+    First pass over dataset to estimate canvas size from selected crop sizes.
+
+    percentile=100 -> use maximum selected crop side.
+    """
+    wsi_paths = read_paths_from_csv(csv_path, col=col)
+
+    max_sides = []
+    n_processed = 0
+    n_errors = 0
+
+    for wsi_path in wsi_paths:
+        if not os.path.exists(wsi_path):
+            print(f"[estimate] Skipping missing: {wsi_path}")
+            continue
+
+        try:
+            reader = WSIReader.open(wsi_path)
+            thumb_rgb = get_thumbnail(reader, thumbnail_mpp=thumbnail_mpp)
+
+            selected_bboxes, _, _ = _selected_component_bboxes_from_thumb(
+                thumb_rgb=thumb_rgb,
+                pad=pad,
+                min_area_ratio=min_area_ratio,
+                merge_radius_px=merge_radius_px,
+                use_8_connectivity=use_8_connectivity,
+                split_area_frac=split_area_frac,
+                density_single_thresh=density_single_thresh,
+                small_component_policy=small_component_policy,
+            )
+
+            for (rmin, rmax, cmin, cmax, _) in selected_bboxes:
+                h = rmax - rmin
+                w = cmax - cmin
+                max_sides.append(max(h, w))
+
+            n_processed += 1
+
+        except Exception as e:
+            n_errors += 1
+            print(f"[estimate] ERROR on {wsi_path}: {e}")
+
+    if not max_sides:
+        raise RuntimeError("Could not estimate canvas size: no valid crops found.")
+
+    raw_canvas = float(np.percentile(max_sides, percentile))
+    canvas_size_px = int(math.ceil(raw_canvas / round_up_to) * round_up_to)
+
+    print(f"[estimate] Processed slides: {n_processed}")
+    print(f"[estimate] Errors: {n_errors}")
+    print(f"[estimate] Number of selected crops: {len(max_sides)}")
+    print(f"[estimate] Percentile used: {percentile}")
+    print(f"[estimate] Raw suggested canvas: {raw_canvas:.2f}")
+    print(f"[estimate] Rounded canvas_size_px: {canvas_size_px}")
+
+    return canvas_size_px
+
+
+# -------------------------
+# Core processing
+# -------------------------
+
+def process_wsi_thumbnail_to_canvas_multi(
+    wsi_path: str,
+    target_size: int = 256,
+    canvas_size_px: int = 1024,
+    thumbnail_mpp: float = 8.0,
+    pad: int = 20,
+    min_area_ratio: float = 0.01,
+    merge_radius_px: int = 20,
+    use_8_connectivity: bool = True,
+    split_area_frac: float = 0.25,
+    density_single_thresh: float = 0.5,
+    small_component_policy: str = "union",
+    crop_if_needed: bool = False,
+):
+    """
+    Detect components on a thumbnail at thumbnail_mpp.
+    For each selected region:
+      - crop it at native thumbnail scale
+      - place it on a fixed square canvas
+      - optionally crop if larger than canvas
+      - resize the whole canvas to target_size
+
+    Returns a list of dicts.
+    """
+    reader = WSIReader.open(wsi_path)
+    thumb_rgb = get_thumbnail(reader, thumbnail_mpp=thumbnail_mpp)
+
+    selected_bboxes, final_mask, _ = _selected_component_bboxes_from_thumb(
+        thumb_rgb=thumb_rgb,
+        pad=pad,
+        min_area_ratio=min_area_ratio,
+        merge_radius_px=merge_radius_px,
+        use_8_connectivity=use_8_connectivity,
+        split_area_frac=split_area_frac,
+        density_single_thresh=density_single_thresh,
+        small_component_policy=small_component_policy,
+    )
+
+    final_effective_mpp = float(thumbnail_mpp) * float(canvas_size_px) / float(target_size)
+    size_tag = (
+        f"{target_size}x{target_size}"
+        f"_fromCanvas{canvas_size_px}"
+        f"_thumbmpp{thumbnail_mpp:g}"
+    )
+
+    outputs = []
+
+    for (rmin, rmax, cmin, cmax, area_px) in selected_bboxes:
+        crop_rgb = thumb_rgb[rmin:rmax, cmin:cmax, :]
+        crop_mask = final_mask[rmin:rmax, cmin:cmax]
+
+        rgb_out, mask_out = embed_on_canvas_then_resize(
+            rgb_np=crop_rgb,
+            mask_np=crop_mask,
+            canvas_size_px=canvas_size_px,
+            target_size=target_size,
+            crop_if_needed=crop_if_needed,
+        )
+
+        outputs.append({
+            "rgb": rgb_out,
+            "mask": mask_out,
+            "bbox": (rmin, rmax, cmin, cmax),
+            "area_px": int(area_px),
+            "target_size": target_size,
+            "canvas_size_px": canvas_size_px,
+            "final_effective_mpp": final_effective_mpp,
+            "size_tag": size_tag,
+        })
+
+    return outputs
+
+
+# -------------------------
+# CSV runner
+# -------------------------
+
+def process_from_csv(
+    csv_path: str,
+    output_root_img: str,
+    output_root_mask: str,
+    input_root_for_structure: str | None = None,
+    **process_kwargs,
+):
+    ensure_dir(output_root_img)
+    ensure_dir(output_root_mask)
+
+    wsi_paths = read_paths_from_csv(csv_path, col="path")
+    if input_root_for_structure is None and wsi_paths:
+        input_root_for_structure = os.path.commonpath(wsi_paths)
+
+    target_size = int(process_kwargs.get("target_size", 256))
+    canvas_size_px = int(process_kwargs["canvas_size_px"])
+    thumbnail_mpp = float(process_kwargs.get("thumbnail_mpp", 8.0))
+    size_tag = (
+        f"{target_size}x{target_size}"
+        f"_fromCanvas{canvas_size_px}"
+        f"_thumbmpp{thumbnail_mpp:g}"
+    )
+
+    for wsi_path in wsi_paths:
+        if not os.path.exists(wsi_path):
+            print(f"Skipping missing: {wsi_path}")
+            continue
+
+        slide_name = os.path.splitext(os.path.basename(wsi_path))[0]
+
+        if input_root_for_structure:
+            rel = os.path.relpath(wsi_path, start=input_root_for_structure)
+            rel_dir = os.path.dirname(rel)
+            out_dir_img = os.path.join(output_root_img, rel_dir)
+            out_dir_mask = os.path.join(output_root_mask, rel_dir)
+        else:
+            out_dir_img = output_root_img
+            out_dir_mask = output_root_mask
+
+        ensure_dir(out_dir_img)
+        ensure_dir(out_dir_mask)
+
+        print(f"Processing: {wsi_path}")
+        try:
+            parts = process_wsi_thumbnail_to_canvas_multi(wsi_path, **process_kwargs)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            continue
+
+        if len(parts) == 1:
+            rgb_path = os.path.join(out_dir_img, f"{slide_name}_{size_tag}.png")
+            mask_path = os.path.join(out_dir_mask, f"{slide_name}_{size_tag}_mask.png")
+            parts[0]["rgb"].save(rgb_path)
+            parts[0]["mask"].save(mask_path)
+            print(f"  Saved {rgb_path}")
+            print(f"  Saved {mask_path}")
+            print(f"  Final effective mpp: {parts[0]['final_effective_mpp']:.3f}")
+        else:
+            for i, it in enumerate(parts, start=1):
+                suffix = f"_part{i:02d}_{size_tag}"
+                rgb_path = os.path.join(out_dir_img, f"{slide_name}{suffix}.png")
+                mask_path = os.path.join(out_dir_mask, f"{slide_name}{suffix}_mask.png")
+                it["rgb"].save(rgb_path)
+                it["mask"].save(mask_path)
+                print(f"  Saved {rgb_path} (area={it['area_px']})")
+                print(f"  Saved {mask_path}")
+                print(f"  Final effective mpp: {it['final_effective_mpp']:.3f}")
+
+        print("  Done.")
+
+
+# -------------------------
+# Entry point
+# -------------------------
+
+if __name__ == "__main__":
+    csv_path = "/storage/DSH/projects/iaso/diffusion_wholewsi/code/preprocessing/tcga_brca_histoqc_cleanList.csv"
+    input_root_for_structure = "/storage/DSH/projects/data/TCGA/BRCA/raw_data/wsi"
+
+    # ----------------------------------------
+    # User choices
+    # ----------------------------------------
+    target_size = 256
+    thumbnail_mpp = 8.0
+
+    # Choose:
+    #   "max"   -> auto estimate canvas from dataset, keep full crop visible
+    #   "fixed" -> use fixed canvas_size_px, crop if crop is larger than canvas
+    canvas_mode = "max"   # "max" or "fixed"
+
+    # Used only if canvas_mode == "fixed"
+    fixed_canvas_size_px = 1024
+
+    # If canvas_mode == "max", choose percentile:
+    # 100.0 = true max
+    # 95.0  = fit most crops, not all
+    canvas_percentile = 85.0  #100.0
+
+    # ----------------------------------------
+    # Selection parameters
+    # ----------------------------------------
+    process_kwargs = dict(
+        target_size=target_size,
+        thumbnail_mpp=thumbnail_mpp,
+        pad=20,
+        min_area_ratio=0.01,
+        merge_radius_px=20,
+        use_8_connectivity=True,
+        split_area_frac=0.25,
+        density_single_thresh=0.5,
+        small_component_policy="union",  # or "largest"
+    )
+
+    # ----------------------------------------
+    # Resolve canvas mode
+    # ----------------------------------------
+    if canvas_mode == "max":
+        canvas_size_px = estimate_canvas_size_from_csv(
+            csv_path=csv_path,
+            col="path",
+            thumbnail_mpp=thumbnail_mpp,
+            pad=process_kwargs["pad"],
+            min_area_ratio=process_kwargs["min_area_ratio"],
+            merge_radius_px=process_kwargs["merge_radius_px"],
+            use_8_connectivity=process_kwargs["use_8_connectivity"],
+            split_area_frac=process_kwargs["split_area_frac"],
+            density_single_thresh=process_kwargs["density_single_thresh"],
+            small_component_policy=process_kwargs["small_component_policy"],
+            percentile=canvas_percentile,
+            round_up_to=32,
+        )
+        crop_if_needed = False
+
+    elif canvas_mode == "fixed":
+        canvas_size_px = int(fixed_canvas_size_px)
+        crop_if_needed = True
+
+    else:
+        raise ValueError("canvas_mode must be 'max' or 'fixed'")
+
+    process_kwargs["canvas_size_px"] = canvas_size_px
+    process_kwargs["crop_if_needed"] = crop_if_needed
+
+    final_effective_mpp = thumbnail_mpp * canvas_size_px / target_size
+
+    mode_tag = f"canvasMode-{canvas_mode}"
+    if canvas_mode == "fixed":
+        mode_tag += f"_crop"
+    else:
+        mode_tag += f"_pct{canvas_percentile:g}"
+
+    output_root_img = (
+        f"/storage/DSH/projects/iaso/data/"
+        f"BRCA_prepr{target_size}_{mode_tag}_canvas{canvas_size_px}_thumbmpp{thumbnail_mpp:g}/img"
+    )
+    output_root_mask = (
+        f"/storage/DSH/projects/iaso/data/"
+        f"BRCA_prepr{target_size}_{mode_tag}_canvas{canvas_size_px}_thumbmpp{thumbnail_mpp:g}/masks"
+    )
+
+    print(f"canvas_mode            = {canvas_mode}")
+    print(f"thumbnail_mpp          = {thumbnail_mpp}")
+    print(f"canvas_size_px         = {canvas_size_px}")
+    print(f"target_size            = {target_size}")
+    print(f"crop_if_needed         = {crop_if_needed}")
+    print(f"final effective mpp    = {final_effective_mpp:.3f}")
+
+    process_from_csv(
+        csv_path=csv_path,
+        output_root_img=output_root_img,
+        output_root_mask=output_root_mask,
+        input_root_for_structure=input_root_for_structure,
+        **process_kwargs,
+    )
